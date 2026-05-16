@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+Gmail to LLM Exporter
+Exports emails matching a Gmail search query with full body content.
+
+Usage:
+    python gmail_export.py "label:inbox after:2024/01/01" [options]
+
+Run with --help for full CLI reference.
+"""
+
+import os
+import json
+import base64
+import re
+import html
+import argparse
+from datetime import datetime
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_FILE = os.path.join(SCRIPT_DIR, 'credentials.json')
+TOKEN_FILE = os.path.join(SCRIPT_DIR, 'token.json')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Export Gmail emails matching a search query for LLM use.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python gmail_export.py "label:inbox after:2024/01/01"
+  python gmail_export.py "from:boss@company.com" --max-results 100 --format txt
+  python gmail_export.py "subject:invoice" --format both --output-file invoices
+        """
+    )
+    parser.add_argument(
+        'query',
+        help='Gmail search query (same syntax as the Gmail search bar)'
+    )
+    parser.add_argument(
+        '--max-results', '-n',
+        type=int,
+        default=50,
+        dest='max_results',
+        metavar='N',
+        help='Maximum number of emails to fetch (default: 50)'
+    )
+    parser.add_argument(
+        '--format', '-f',
+        choices=['json', 'txt', 'both'],
+        default='json',
+        dest='output_format',
+        help='Output format: json, txt, or both (default: json)'
+    )
+    parser.add_argument(
+        '--output-dir', '-o',
+        default=os.path.join(SCRIPT_DIR, 'output'),
+        dest='output_dir',
+        metavar='DIR',
+        help='Output directory (default: ./output relative to script)'
+    )
+    parser.add_argument(
+        '--output-file',
+        default=None,
+        dest='output_file',
+        metavar='NAME',
+        help='Base filename without extension (default: auto-generated from timestamp)'
+    )
+    return parser.parse_args()
+
+
+def authenticate():
+    """Authenticate with Gmail API using OAuth2."""
+    creds = None
+
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(CREDENTIALS_FILE):
+                raise FileNotFoundError(
+                    f"credentials.json not found at: {CREDENTIALS_FILE}\n"
+                    "Download it from Google Cloud Console > APIs & Services > Credentials."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        with open(TOKEN_FILE, 'w') as token:
+            token.write(creds.to_json())
+
+    return build('gmail', 'v1', credentials=creds)
+
+
+def get_body(payload):
+    """Extract plain text body from email payload (handles nested MIME parts)."""
+    body = ''
+
+    def _decode(data):
+        return base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='replace')
+
+    def _html_to_text(html_content):
+        """Basic HTML stripping for LLM readability."""
+        text = re.sub(r'<br\s*/?>', '\n', html_content, flags=re.IGNORECASE)
+        text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = html.unescape(text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    def _extract(part):
+        nonlocal body
+        mime = part.get('mimeType', '')
+        data = part.get('body', {}).get('data', '')
+
+        if mime == 'text/plain' and data:
+            body = _decode(data)
+            return True  # Prefer plain text, stop searching
+
+        if mime == 'text/html' and data and not body:
+            body = _html_to_text(_decode(data))
+
+        for sub in part.get('parts', []):
+            if _extract(sub):
+                return True
+        return False
+
+    _extract(payload)
+    return body.strip()
+
+
+def get_header(headers, name):
+    """Get a specific header value by name."""
+    for h in headers:
+        if h['name'].lower() == name.lower():
+            return h['value']
+    return ''
+
+
+def fetch_emails(service, query, max_results):
+    """Fetch emails matching the query with full content."""
+    print(f"\n🔍 Query: {query}")
+    print(f"📦 Max results: {max_results}\n")
+
+    # Get list of matching message IDs
+    results = service.users().messages().list(
+        userId='me', q=query, maxResults=max_results
+    ).execute()
+
+    messages = results.get('messages', [])
+    if not messages:
+        print("⚠️  No emails found for this query.")
+        return []
+
+    print(f"📬 Found {len(messages)} email(s). Fetching content...")
+
+    emails = []
+    for i, msg in enumerate(messages, 1):
+        detail = service.users().messages().get(
+            userId='me', id=msg['id'], format='full'
+        ).execute()
+
+        headers = detail['payload'].get('headers', [])
+        body = get_body(detail['payload'])
+        timestamp = int(detail.get('internalDate', 0)) / 1000
+        date_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else ''
+
+        email = {
+            'id': msg['id'],
+            'thread_id': detail.get('threadId', ''),
+            'date': date_str,
+            'from': get_header(headers, 'From'),
+            'to': get_header(headers, 'To'),
+            'subject': get_header(headers, 'Subject'),
+            'labels': detail.get('labelIds', []),
+            'snippet': detail.get('snippet', ''),
+            'body': body,
+        }
+
+        emails.append(email)
+        print(f"  ✅ [{i}/{len(messages)}] {email['subject'][:60] or '(No subject)'}")
+
+    return emails
+
+
+def save_json(emails, output_file):
+    """Save emails as JSON (structured, good for programmatic use)."""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(emails, f, ensure_ascii=False, indent=2)
+    print(f"\n💾 Saved {len(emails)} emails to {output_file} (JSON)")
+
+
+def save_txt(emails, output_file, query):
+    """Save emails as plain text (great for pasting directly into a LLM context)."""
+    txt_file = output_file.replace('.json', '.txt')
+    with open(txt_file, 'w', encoding='utf-8') as f:
+        f.write(f"GMAIL EXPORT — Query: {query}\n")
+        f.write(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 70 + "\n\n")
+
+        for i, email in enumerate(emails, 1):
+            f.write(f"EMAIL {i} of {len(emails)}\n")
+            f.write("-" * 70 + "\n")
+            f.write(f"Date:    {email['date']}\n")
+            f.write(f"From:    {email['from']}\n")
+            f.write(f"To:      {email['to']}\n")
+            f.write(f"Subject: {email['subject']}\n")
+            f.write(f"Labels:  {', '.join(email['labels'])}\n")
+            f.write("\nBODY:\n")
+            f.write(email['body'] or "(No body content)\n")
+            f.write("\n\n" + "=" * 70 + "\n\n")
+
+    print(f"💾 Saved {len(emails)} emails to {txt_file} (Plain text)")
+    return txt_file
+
+
+def main():
+    args = parse_args()
+
+    print("📧 Gmail to LLM Exporter")
+    print("=" * 40)
+
+    # Resolve and create output directory
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Build output base path
+    if args.output_file:
+        base_name = args.output_file
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f"emails_{timestamp}"
+
+    json_path = os.path.join(output_dir, f"{base_name}.json")
+    txt_path = os.path.join(output_dir, f"{base_name}.txt")
+
+    service = authenticate()
+    print("✅ Authentication successful!")
+
+    emails = fetch_emails(service, args.query, args.max_results)
+    if not emails:
+        return
+
+    output_files = []
+
+    if args.output_format in ('json', 'both'):
+        save_json(emails, json_path)
+        output_files.append(json_path)
+
+    if args.output_format in ('txt', 'both'):
+        save_txt(emails, txt_path, args.query)
+        output_files.append(txt_path)
+
+    # Print summary
+    print(f"\n📊 Summary:")
+    print(f"   Emails exported : {len(emails)}")
+    print(f"   Output directory: {output_dir}")
+    for f in output_files:
+        print(f"   Output file     : {os.path.basename(f)}")
+    print(f"\n💡 Tips for LLM use:")
+    print(f"   • JSON: feed programmatically, one email at a time")
+    print(f"   • TXT:  paste directly into the LLM context window")
+    print(f"   • For large exports, use --max-results 10-20 to stay within token limits")
+
+
+if __name__ == '__main__':
+    main()
