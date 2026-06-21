@@ -18,6 +18,7 @@ import argparse
 from datetime import datetime
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -52,6 +53,13 @@ Examples:
         help='Maximum number of emails to fetch (default: 50)'
     )
     parser.add_argument(
+        '--threads', '-t',
+        action='store_true',
+        dest='threads',
+        help='Export whole conversation threads (every message in each matching '
+             'thread, including your replies), not just messages matching the query'
+    )
+    parser.add_argument(
         '--format', '-f',
         choices=['json', 'txt', 'both'],
         default='json',
@@ -83,9 +91,20 @@ def authenticate():
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
     if not creds or not creds.valid:
+        refreshed = False
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+                refreshed = True
+            except RefreshError:
+                # Refresh token revoked or expired (e.g. apps in "Testing"
+                # publishing status expire refresh tokens after 7 days).
+                # Discard the stale token and fall back to a fresh login.
+                creds = None
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+
+        if not refreshed:
             if not os.path.exists(CREDENTIALS_FILE):
                 raise FileNotFoundError(
                     f"credentials.json not found at: {CREDENTIALS_FILE}\n"
@@ -145,6 +164,27 @@ def get_header(headers, name):
     return ''
 
 
+def parse_message(detail):
+    """Turn a Gmail message resource into a flat email dict."""
+    headers = detail['payload'].get('headers', [])
+    body = get_body(detail['payload'])
+    timestamp = int(detail.get('internalDate', 0)) / 1000
+    date_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else ''
+
+    return {
+        'id': detail.get('id', ''),
+        'thread_id': detail.get('threadId', ''),
+        'date': date_str,
+        '_ts': timestamp,
+        'from': get_header(headers, 'From'),
+        'to': get_header(headers, 'To'),
+        'subject': get_header(headers, 'Subject'),
+        'labels': detail.get('labelIds', []),
+        'snippet': detail.get('snippet', ''),
+        'body': body,
+    }
+
+
 def fetch_emails(service, query, max_results):
     """Fetch emails matching the query with full content."""
     print(f"\n🔍 Query: {query}")
@@ -168,26 +208,53 @@ def fetch_emails(service, query, max_results):
             userId='me', id=msg['id'], format='full'
         ).execute()
 
-        headers = detail['payload'].get('headers', [])
-        body = get_body(detail['payload'])
-        timestamp = int(detail.get('internalDate', 0)) / 1000
-        date_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else ''
-
-        email = {
-            'id': msg['id'],
-            'thread_id': detail.get('threadId', ''),
-            'date': date_str,
-            'from': get_header(headers, 'From'),
-            'to': get_header(headers, 'To'),
-            'subject': get_header(headers, 'Subject'),
-            'labels': detail.get('labelIds', []),
-            'snippet': detail.get('snippet', ''),
-            'body': body,
-        }
-
+        email = parse_message(detail)
         emails.append(email)
         print(f"  ✅ [{i}/{len(messages)}] {email['subject'][:60] or '(No subject)'}")
 
+    return emails
+
+
+def fetch_threads(service, query, max_results):
+    """Fetch every message in each thread matching the query (full conversations)."""
+    print(f"\n🔍 Query: {query}  (whole threads)")
+    print(f"📦 Max threads: {max_results}\n")
+
+    # Gmail caps maxResults at 500 per page, so paginate until we hit the limit.
+    threads = []
+    page_token = None
+    while len(threads) < max_results:
+        results = service.users().threads().list(
+            userId='me', q=query,
+            maxResults=min(500, max_results - len(threads)),
+            pageToken=page_token,
+        ).execute()
+        threads.extend(results.get('threads', []))
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+
+    threads = threads[:max_results]
+    if not threads:
+        print("⚠️  No threads found for this query.")
+        return []
+
+    print(f"📬 Found {len(threads)} thread(s). Fetching full conversations...")
+
+    emails = []
+    for i, th in enumerate(threads, 1):
+        detail = service.users().threads().get(
+            userId='me', id=th['id'], format='full'
+        ).execute()
+
+        msgs = [parse_message(m) for m in detail.get('messages', [])]
+        msgs.sort(key=lambda e: e['_ts'])
+        emails.extend(msgs)
+
+        subject = next((m['subject'] for m in msgs if m['subject']), '(No subject)')
+        print(f"  ✅ [{i}/{len(threads)}] {subject[:55]} — {len(msgs)} msg(s)")
+
+    print(f"\n🧵 {len(threads)} threads → {len(emails)} total messages")
     return emails
 
 
@@ -245,9 +312,16 @@ def main():
     service = authenticate()
     print("✅ Authentication successful!")
 
-    emails = fetch_emails(service, args.query, args.max_results)
+    if args.threads:
+        emails = fetch_threads(service, args.query, args.max_results)
+    else:
+        emails = fetch_emails(service, args.query, args.max_results)
     if not emails:
         return
+
+    # Drop internal sort key before serializing
+    for e in emails:
+        e.pop('_ts', None)
 
     output_files = []
 
