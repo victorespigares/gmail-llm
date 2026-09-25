@@ -11,6 +11,7 @@ Run with --help for full CLI reference.
 
 import os
 import json
+import subprocess
 import base64
 import re
 import html
@@ -25,8 +26,39 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CREDENTIALS_FILE = os.path.join(SCRIPT_DIR, 'credentials.json')
-TOKEN_FILE = os.path.join(SCRIPT_DIR, 'token.json')
+
+# Gmail allows 6,000 quota units per user per minute and threads.get costs 40,
+# so long exports hit 403 rateLimitExceeded. googleapiclient retries those (and
+# 429/5xx) with randomized exponential backoff of up to 2**n seconds per retry;
+# 7 retries waits up to ~4 min in total, well past the one-minute quota window.
+API_RETRIES = 7
+
+# Credentials live in 1Password, not on disk. Override the item with GMAIL_OP_ITEM.
+OP_ITEM = os.environ.get('GMAIL_OP_ITEM', 'op://Private/Gmail LLM')
+OP_VAULT, OP_TITLE = OP_ITEM[len('op://'):].split('/', 1)
+CREDENTIALS_FIELD = 'credentials_json'
+TOKEN_FIELD = 'token_json'
+
+
+def op_read(field):
+    """Read a field from the 1Password item. Returns None if unset."""
+    result = subprocess.run(
+        ['op', 'read', f'op://{OP_VAULT}/{OP_TITLE}/{field}'],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def op_write(field, value):
+    """Write a field back to the 1Password item."""
+    result = subprocess.run(
+        ['op', 'item', 'edit', OP_TITLE, '--vault', OP_VAULT, f'{field}[password]={value}'],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'Failed to save {field} to {OP_ITEM}: {result.stderr.strip()}')
 
 
 def parse_args():
@@ -84,11 +116,12 @@ Examples:
 
 
 def authenticate():
-    """Authenticate with Gmail API using OAuth2."""
+    """Authenticate with Gmail API using OAuth2, with credentials from 1Password."""
     creds = None
 
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    stored_token = op_read(TOKEN_FIELD)
+    if stored_token:
+        creds = Credentials.from_authorized_user_info(json.loads(stored_token), SCOPES)
 
     if not creds or not creds.valid:
         refreshed = False
@@ -101,20 +134,22 @@ def authenticate():
                 # publishing status expire refresh tokens after 7 days).
                 # Discard the stale token and fall back to a fresh login.
                 creds = None
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
+                op_write(TOKEN_FIELD, '')
 
         if not refreshed:
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError(
-                    f"credentials.json not found at: {CREDENTIALS_FILE}\n"
-                    "Download it from Google Cloud Console > APIs & Services > Credentials."
+            client_config = op_read(CREDENTIALS_FIELD)
+            if not client_config:
+                raise RuntimeError(
+                    f"{CREDENTIALS_FIELD} not found in {OP_ITEM}\n"
+                    "Download the OAuth client JSON from Google Cloud Console > APIs & "
+                    "Services > Credentials, then store it with:\n"
+                    f"  op item edit '{OP_TITLE}' --vault '{OP_VAULT}' "
+                    f"'{CREDENTIALS_FIELD}[password]=<contents of credentials.json>'"
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            flow = InstalledAppFlow.from_client_config(json.loads(client_config), SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
+        op_write(TOKEN_FIELD, creds.to_json())
 
     return build('gmail', 'v1', credentials=creds)
 
@@ -193,7 +228,7 @@ def fetch_emails(service, query, max_results):
     # Get list of matching message IDs
     results = service.users().messages().list(
         userId='me', q=query, maxResults=max_results
-    ).execute()
+    ).execute(num_retries=API_RETRIES)
 
     messages = results.get('messages', [])
     if not messages:
@@ -206,7 +241,7 @@ def fetch_emails(service, query, max_results):
     for i, msg in enumerate(messages, 1):
         detail = service.users().messages().get(
             userId='me', id=msg['id'], format='full'
-        ).execute()
+        ).execute(num_retries=API_RETRIES)
 
         email = parse_message(detail)
         emails.append(email)
@@ -228,7 +263,7 @@ def fetch_threads(service, query, max_results):
             userId='me', q=query,
             maxResults=min(500, max_results - len(threads)),
             pageToken=page_token,
-        ).execute()
+        ).execute(num_retries=API_RETRIES)
         threads.extend(results.get('threads', []))
         page_token = results.get('nextPageToken')
         if not page_token:
@@ -245,7 +280,7 @@ def fetch_threads(service, query, max_results):
     for i, th in enumerate(threads, 1):
         detail = service.users().threads().get(
             userId='me', id=th['id'], format='full'
-        ).execute()
+        ).execute(num_retries=API_RETRIES)
 
         msgs = [parse_message(m) for m in detail.get('messages', [])]
         msgs.sort(key=lambda e: e['_ts'])

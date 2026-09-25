@@ -10,8 +10,6 @@ Export Gmail emails matching any search query into JSON or plain-text files, rea
 gmail-llm/
 ├── gmail_export.py    ← main Python script
 ├── gmail_export.sh    ← shell wrapper (sources venv, runs the script)
-├── credentials.json   ← OAuth2 credentials (download from Google Cloud Console)
-├── token.json         ← saved auth token (auto-created on first run)
 ├── requirements.txt   ← Python dependencies
 ├── output/            ← all exported files land here
 └── venv/              ← Python virtual environment
@@ -23,7 +21,8 @@ gmail-llm/
 
 - **Python 3.8+**
 - A **Google Cloud project** with the Gmail API enabled
-- An **OAuth 2.0 Client ID** (Desktop app type) downloaded as `credentials.json`
+- An **OAuth 2.0 Client ID** (Desktop app type), stored in 1Password
+- **1Password CLI** (`op`) signed in, with a `Gmail LLM` item in the `Private` vault
 
 ### Google Cloud setup (one-time)
 
@@ -31,7 +30,8 @@ gmail-llm/
 2. Create or select a project
 3. **APIs & Services → Library** → search *Gmail API* → Enable
 4. **APIs & Services → Credentials** → Create Credentials → OAuth 2.0 Client ID → Desktop app
-5. Download the JSON file and save it as `credentials.json` in the project folder
+5. Download the JSON file and store it in the `credentials_json` field of the
+   `Gmail LLM` 1Password item (see INSTALL.md) — do not leave it on disk
 
 ---
 
@@ -52,7 +52,8 @@ chmod +x gmail_export.sh
 ```
 
 > **First run:** the script opens a browser window to authenticate with your Google account.  
-> A `token.json` file is saved automatically so you will not be asked again.
+> The token is saved to the `token_json` field of the `Gmail LLM` 1Password item,
+> so you will not be asked again.
 
 ---
 
@@ -150,6 +151,6 @@ Full syntax: https://support.google.com/mail/answer/7190
 
 ## Security notes
 
-- `credentials.json` and `token.json` are listed in `.gitignore` — never commit them
+- Credentials and tokens live only in 1Password, never on disk
 - The script requests **read-only** access (`gmail.readonly` scope)
 - Revoke access any time at [myaccount.google.com/permissions](https://myaccount.google.com/permissions)

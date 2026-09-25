@@ -17,9 +17,17 @@ python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 ```
 
-### 3. Place credentials
+### 3. Store credentials in 1Password
 
-Download `credentials.json` from Google Cloud Console and put it in `~/venvs/gmail-llm/`.
+Download the OAuth client JSON from Google Cloud Console, then store it in the
+`Gmail LLM` item (vault `Private`) instead of leaving it on disk:
+
+```bash
+op item create --category="API Credential" --title="Gmail LLM" --vault=Private \
+    "credentials_json[password]=$(cat /path/to/downloaded.json)"
+```
+
+Override the item with `GMAIL_OP_ITEM=op://<vault>/<item>` if you use another one.
 
 ### 4. Make the shell script executable
 
@@ -34,7 +42,8 @@ chmod +x gmail_export.sh
 ```
 
 The browser will open for Google authentication on the first run.  
-A `token.json` file is saved automatically — no re-authentication needed afterwards.
+The resulting token is written back to the `token_json` field of the same
+1Password item — no re-authentication needed afterwards, and nothing on disk.
 
 ---
 
